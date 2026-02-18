@@ -1,0 +1,1052 @@
+// ============================================================
+//  FAMILY MEAL PLANNER — Apps Script v4
+//
+//  CHANGES IN v4:
+//  - Dynamic servings: Adults + Leftover Nights columns now drive
+//    actual serving counts and scale ingredient quantities
+//  - Auto Last Made: stamped automatically when you save to Catalogue
+//  - Single status column on Grocery List (Need It / Have It / In Cart)
+//  - Healthier, more varied Claude prompt with explicit cuisine rotation
+//
+//  HOW TO INSTALL:
+//  1. Go to script.google.com > New project
+//  2. Delete all existing code, paste this entire file
+//  3. Save (Ctrl+S), select "setupMealPlanner" in dropdown > Run
+//  4. Grant permissions when prompted
+//  5. Find "Family Meal Planner" in your Google Drive (or check Execution Log for URL)
+//
+//  AFTER SETUP:
+//  Extensions > Apps Script > Project Settings > Script Properties
+//  Add:  ANTHROPIC_API_KEY  =  your-key-from-console.anthropic.com
+// ============================================================
+
+var C = {
+  GREEN_DARK:   '#1E6B3C',
+  GREEN_MED:    '#2D9E5F',
+  GREEN_LIGHT:  '#D6F0E0',
+  ORANGE:       '#E8722A',
+  ORANGE_LIGHT: '#FDE8D8',
+  YELLOW:       '#FFF9C4',
+  WHITE:        '#FFFFFF',
+  GRAY_LIGHT:   '#F5F5F5',
+  RED_LIGHT:    '#FFE8E8',
+  BLUE_LINK:    '#1155CC',
+  TEXT_MED:     '#555555',
+};
+
+var SN = {
+  MEALS:     'Weekly Meals',
+  RECIPES:   'Recipes',
+  GROCERY:   'Grocery List',
+  CATALOGUE: 'Meal Catalogue',
+  PANTRY:    'Pantry and Staples',
+};
+
+var CLAUDE_MODEL = 'claude-opus-4-6';
+
+// Column indices on Weekly Meals tab (1-based)
+var COL = {
+  NUM:            1,
+  NAME:           2,
+  CUISINE:        3,
+  COOK_TIME:      4,
+  ADULTS:         5,   // was "Servings" — now editable number
+  LEFTOVER_NIGHTS:6,   // was hardcoded 1 — now editable number
+  SERVINGS_LABEL: 7,   // formula: Adults * (1 + Leftover Nights)
+  SELECT:         8,
+  LAST_MADE:      9,
+  RATING:         10,
+};
+
+// ============================================================
+//  SETUP — run once
+// ============================================================
+function setupMealPlanner() {
+  var ss = SpreadsheetApp.create('Family Meal Planner');
+
+  buildWeeklyMealsTab(ss);
+  buildRecipesTab(ss);
+  buildGroceryTab(ss);
+  buildCatalogueTab(ss);
+  buildPantryTab(ss);
+
+  var defaultSheet = ss.getSheetByName('Sheet1');
+  if (defaultSheet) ss.deleteSheet(defaultSheet);
+
+  var order = [SN.MEALS, SN.RECIPES, SN.GROCERY, SN.CATALOGUE, SN.PANTRY];
+  for (var i = 0; i < order.length; i++) {
+    var sheet = ss.getSheetByName(order[i]);
+    if (sheet) {
+      ss.setActiveSheet(sheet);
+      ss.moveActiveSheet(i + 1);
+    }
+  }
+
+  ss.setActiveSheet(ss.getSheetByName(SN.MEALS));
+  var url = ss.getUrl();
+  Logger.log('Created: ' + url);
+
+  try {
+    var html = HtmlService.createHtmlOutput(
+      '<p style="font-family:Arial;font-size:14px">Your Meal Planner is ready!</p>' +
+      '<p style="font-family:Arial"><a href="' + url + '" target="_blank">Click here to open it</a></p>' +
+      '<p style="font-family:Arial;font-size:12px;color:#555">Or find "Family Meal Planner" in your Google Drive.</p>'
+    ).setWidth(420).setHeight(160);
+    SpreadsheetApp.getUi().showModalDialog(html, 'Setup Complete!');
+  } catch(e) {
+    Logger.log('Open: ' + url);
+  }
+}
+
+// ============================================================
+//  MENU
+// ============================================================
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('Meal Planner')
+    .addItem('Generate This Weeks Meals', 'generateMeals')
+    .addSeparator()
+    .addItem('Refresh Grocery List', 'refreshGroceryList')
+    .addItem('Save Rated Meals to Catalogue', 'saveRatedMealsToCatalogue')
+    .addSeparator()
+    .addItem('HEB Cart - Phase 2 Info', 'openHEBCartInfo')
+    .addToUi();
+}
+
+// ============================================================
+//  TAB 1: WEEKLY MEALS
+//  Columns: # | Meal Name | Cuisine | Cook Time | Adults |
+//           Leftover Nights | Total Servings | Select? |
+//           Last Made | Rating
+// ============================================================
+function buildWeeklyMealsTab(ss) {
+  var ws = ss.insertSheet(SN.MEALS);
+  ws.setFrozenRows(3);
+  ws.setHiddenGridlines(true);
+
+  // Title
+  ws.getRange(1, 1, 1, 10).merge()
+    .setValue('FAMILY MEAL PLANNER — Weekly Menu')
+    .setBackground(C.GREEN_DARK)
+    .setFontColor(C.WHITE).setFontFamily('Arial').setFontSize(16).setFontWeight('bold')
+    .setHorizontalAlignment('center').setVerticalAlignment('middle');
+  ws.setRowHeight(1, 40);
+
+  // Subtitle
+  ws.getRange(2, 1, 1, 10).merge()
+    .setValue('Adjust Adults + Leftover Nights per meal — Total Servings and ingredient quantities update automatically')
+    .setBackground(C.GREEN_LIGHT)
+    .setFontColor(C.TEXT_MED).setFontFamily('Arial').setFontSize(10).setFontStyle('italic')
+    .setHorizontalAlignment('center').setVerticalAlignment('middle');
+  ws.setRowHeight(2, 22);
+
+  // Headers — note column order matches COL constants above
+  var headers = ['#', 'Meal Name', 'Cuisine', 'Cook Time', 'Adults', 'Leftover\nNights', 'Total\nServings', 'Select?', 'Last Made', 'Rating\n(1-5)'];
+  var widths  = [35,  220,         115,       85,          65,       80,                  80,                75,        100,         80];
+  for (var i = 0; i < headers.length; i++) {
+    ws.getRange(3, i + 1)
+      .setValue(headers[i])
+      .setBackground(C.GREEN_DARK)
+      .setFontColor(C.WHITE).setFontFamily('Arial').setFontSize(10).setFontWeight('bold')
+      .setHorizontalAlignment('center').setVerticalAlignment('middle').setWrap(true)
+      .setBorder(true, true, true, true, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+    ws.setColumnWidth(i + 1, widths[i]);
+  }
+  ws.setRowHeight(3, 32);
+
+  // Meal rows — Adults defaults to 2, Leftover Nights defaults to 1
+  // Total Servings = Adults * (1 + Leftover Nights) = 2 * 2 = 4
+  var meals = [
+    [1, 'Sheet Pan Lemon Herb Chicken', 'American', '35 min'],
+    [2, 'Ground Beef Tacos',            'Tex-Mex',  '25 min'],
+    [3, 'Creamy Garlic Pasta',          'Italian',  '30 min'],
+    [4, 'Teriyaki Salmon and Rice',     'Asian',    '30 min'],
+    [5, 'Black Bean Chicken Bowls',     'Tex-Mex',  '30 min'],
+    [6, 'Sausage and Veggie Skillet',   'American', '25 min'],
+    [7, 'Honey Garlic Shrimp Stir Fry', 'Asian',    '25 min'],
+  ];
+
+  for (var i = 0; i < meals.length; i++) {
+    var r  = i + 4;
+    var bg = (i % 2 === 0) ? C.WHITE : C.GRAY_LIGHT;
+
+    // Static columns
+    ws.getRange(r, 1, 1, 4).setValues([meals[i]])
+      .setBackground(bg).setFontFamily('Arial').setFontSize(10).setVerticalAlignment('middle')
+      .setBorder(true, true, true, true, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+
+    // Adults (editable, default 2)
+    ws.getRange(r, COL.ADULTS).setValue(2)
+      .setBackground(C.YELLOW).setFontFamily('Arial').setFontSize(10)
+      .setHorizontalAlignment('center').setVerticalAlignment('middle').setFontWeight('bold')
+      .setBorder(true, true, true, true, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+
+    // Leftover Nights (editable, default 1)
+    ws.getRange(r, COL.LEFTOVER_NIGHTS).setValue(1)
+      .setBackground(C.YELLOW).setFontFamily('Arial').setFontSize(10)
+      .setHorizontalAlignment('center').setVerticalAlignment('middle').setFontWeight('bold')
+      .setBorder(true, true, true, true, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+
+    // Total Servings — formula: Adults * (1 + Leftover Nights)
+    var adultsCell    = 'E' + r;
+    var leftoverCell  = 'F' + r;
+    ws.getRange(r, COL.SERVINGS_LABEL)
+      .setFormula('=' + adultsCell + '*(1+' + leftoverCell + ')')
+      .setBackground(C.GREEN_LIGHT).setFontFamily('Arial').setFontSize(10)
+      .setHorizontalAlignment('center').setVerticalAlignment('middle')
+      .setBorder(true, true, true, true, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+
+    // Select?
+    ws.getRange(r, COL.SELECT).setValue('No')
+      .setBackground(bg).setFontFamily('Arial').setFontSize(10)
+      .setHorizontalAlignment('center').setVerticalAlignment('middle')
+      .setBorder(true, true, true, true, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+
+    // Last Made
+    ws.getRange(r, COL.LAST_MADE).setValue('')
+      .setBackground(bg).setFontFamily('Arial').setFontSize(10)
+      .setHorizontalAlignment('center').setVerticalAlignment('middle')
+      .setBorder(true, true, true, true, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+
+    // Rating
+    ws.getRange(r, COL.RATING).setValue('')
+      .setBackground(bg).setFontFamily('Arial').setFontSize(10)
+      .setHorizontalAlignment('center').setVerticalAlignment('middle')
+      .setBorder(true, true, true, true, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+
+    ws.getRange(r, 1).setFontWeight('bold').setFontColor(C.GREEN_DARK).setHorizontalAlignment('center');
+    ws.setRowHeight(r, 26);
+  }
+
+  addDropdown(ws, 'H4:H10', ['Yes', 'No']);
+  addDropdown(ws, 'J4:J10', ['1', '2', '3', '4', '5']);
+
+  // Legend for yellow cells
+  ws.setRowHeight(11, 10);
+  ws.getRange(12, 1, 1, 10).merge()
+    .setValue('Yellow cells = editable inputs. Change Adults or Leftover Nights per meal and Total Servings + grocery quantities update automatically.')
+    .setBackground(C.YELLOW).setFontFamily('Arial').setFontSize(9).setFontColor('#555500')
+    .setHorizontalAlignment('left').setVerticalAlignment('middle');
+  ws.setRowHeight(12, 18);
+
+  // How to use
+  ws.setRowHeight(13, 6);
+  ws.getRange(14, 1, 1, 10).merge()
+    .setValue('HOW TO USE THIS SHEET')
+    .setBackground(C.GREEN_MED).setFontColor(C.WHITE).setFontFamily('Arial').setFontSize(10).setFontWeight('bold')
+    .setHorizontalAlignment('left').setVerticalAlignment('middle');
+  ws.setRowHeight(14, 22);
+
+  var steps = [
+    '1.  Run Meal Planner > Generate This Weeks Meals to get 7 AI-generated suggestions.',
+    '2.  Adjust Adults and Leftover Nights for each meal if needed — Total Servings updates live.',
+    '3.  Set Select? to Yes for the 4 meals you want this week.',
+    '4.  Run Meal Planner > Refresh Grocery List — ingredients scale to your serving sizes with HEB links.',
+    '5.  On the Grocery List tab, toggle status for each item: Need It / Have It / In Cart.',
+    '6.  After cooking, add a rating (1-5), then Save to Catalogue to build your recipe library.',
+  ];
+  for (var i = 0; i < steps.length; i++) {
+    var r  = 15 + i;
+    var bg = (i % 2 === 0) ? C.GREEN_LIGHT : C.WHITE;
+    ws.getRange(r, 1, 1, 10).merge()
+      .setValue(steps[i])
+      .setBackground(bg).setFontColor('#333333').setFontFamily('Arial').setFontSize(9)
+      .setHorizontalAlignment('left').setVerticalAlignment('middle');
+    ws.setRowHeight(r, 18);
+  }
+}
+
+// ============================================================
+//  TAB 2: RECIPES
+// ============================================================
+function buildRecipesTab(ss) {
+  var ws = ss.insertSheet(SN.RECIPES);
+  ws.setFrozenRows(3);
+  ws.setHiddenGridlines(true);
+
+  ws.getRange(1, 1, 1, 6).merge()
+    .setValue('WEEKLY RECIPES')
+    .setBackground(C.GREEN_DARK).setFontColor(C.WHITE).setFontFamily('Arial').setFontSize(16).setFontWeight('bold')
+    .setHorizontalAlignment('center').setVerticalAlignment('middle');
+  ws.setRowHeight(1, 40);
+
+  ws.getRange(2, 1, 1, 6).merge()
+    .setValue('Recipes auto-populated when you generate meals. Ingredient quantities scale with your Adults + Leftover Nights settings.')
+    .setBackground(C.GREEN_LIGHT).setFontColor(C.TEXT_MED).setFontFamily('Arial').setFontSize(10).setFontStyle('italic')
+    .setHorizontalAlignment('center').setVerticalAlignment('middle');
+  ws.setRowHeight(2, 22);
+
+  var headers = ['#', 'Meal Name', 'Ingredients (base: 2 adults)', 'Instructions', 'Cook Tips', 'HEB Search'];
+  var widths  = [35,  220,         280,                             400,            240,          130];
+  for (var i = 0; i < headers.length; i++) {
+    ws.getRange(3, i + 1)
+      .setValue(headers[i])
+      .setBackground(C.GREEN_DARK).setFontColor(C.WHITE).setFontFamily('Arial').setFontSize(10).setFontWeight('bold')
+      .setHorizontalAlignment('center').setVerticalAlignment('middle').setWrap(true)
+      .setBorder(true, true, true, true, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+    ws.setColumnWidth(i + 1, widths[i]);
+  }
+  ws.setRowHeight(3, 28);
+
+  // Sample placeholder rows
+  var samples = [
+    [1, 'Sheet Pan Lemon Herb Chicken',
+     '- 1 lb chicken thighs\n- 1 lemon\n- 3 cloves garlic\n- 1 tbsp olive oil\n- 1 tsp rosemary\n- 1 tsp thyme\n- 1 cup broccoli\n- Salt and pepper',
+     '1. Preheat oven to 425F\n2. Toss chicken and broccoli with oil, garlic, salt and pepper\n3. Arrange on sheet pan\n4. Roast 30-35 min until chicken reaches 165F\n5. Squeeze lemon over before serving',
+     'Quantities shown are base (2 adults). They scale automatically when you change your Adults setting.',
+     'chicken thighs'],
+    [2, 'Ground Beef Tacos',
+     '- 0.5 lb ground beef 80/20\n- 0.5 packet taco seasoning\n- 4 flour tortillas\n- 0.5 cup shredded cheese\n- Sour cream and salsa\n- Shredded lettuce\n- 0.5 tomato diced',
+     '1. Brown beef over medium-high heat\n2. Drain fat\n3. Add seasoning and 1/3 cup water\n4. Simmer 5 min\n5. Warm tortillas\n6. Build tacos with toppings',
+     'Quantities shown are base (2 adults). Scale up in the Weekly Meals tab.',
+     'ground beef'],
+  ];
+
+  for (var i = 0; i < samples.length; i++) {
+    var r  = i + 4;
+    var bg = (i % 2 === 0) ? C.WHITE : C.GRAY_LIGHT;
+    var s  = samples[i];
+    ws.getRange(r, 1, 1, 5).setValues([[s[0], s[1], s[2], s[3], s[4]]])
+      .setBackground(bg).setFontFamily('Arial').setFontSize(9)
+      .setVerticalAlignment('top').setWrap(true)
+      .setBorder(true, true, true, true, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+    ws.getRange(r, 2).setFontWeight('bold').setFontColor(C.GREEN_DARK).setFontSize(10);
+    var hebUrl = 'https://www.heb.com/search/?q=' + encodeURIComponent(s[5]);
+    ws.getRange(r, 6)
+      .setFormula('=HYPERLINK("' + hebUrl + '","Search HEB")')
+      .setBackground(bg).setFontColor(C.BLUE_LINK)
+      .setHorizontalAlignment('center').setVerticalAlignment('top')
+      .setBorder(true, true, true, true, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+    ws.setRowHeight(r, 130);
+  }
+}
+
+// ============================================================
+//  TAB 3: GROCERY LIST
+//  Single "Status" column: Need It / Have It / In Cart
+// ============================================================
+function buildGroceryTab(ss) {
+  var ws = ss.insertSheet(SN.GROCERY);
+  ws.setFrozenRows(4);
+  ws.setHiddenGridlines(true);
+
+  ws.getRange(1, 1, 1, 7).merge()
+    .setValue('THIS WEEK\'S GROCERY LIST')
+    .setBackground(C.GREEN_DARK).setFontColor(C.WHITE).setFontFamily('Arial').setFontSize(16).setFontWeight('bold')
+    .setHorizontalAlignment('center').setVerticalAlignment('middle');
+  ws.setRowHeight(1, 40);
+
+  ws.getRange(2, 1, 1, 7).merge()
+    .setValue('Status: "Have It" = skip (grays out row)  |  "Need It" = add to cart  |  "In Cart" = done')
+    .setBackground(C.GREEN_LIGHT).setFontColor(C.TEXT_MED).setFontFamily('Arial').setFontSize(10).setFontStyle('italic')
+    .setHorizontalAlignment('center').setVerticalAlignment('middle');
+  ws.setRowHeight(2, 22);
+
+  // Meal ingredients section header
+  ws.getRange(3, 1, 1, 7).merge()
+    .setValue('MEAL INGREDIENTS  (auto-filled and quantity-scaled from your selected meals)')
+    .setBackground(C.GREEN_MED).setFontColor(C.WHITE).setFontFamily('Arial').setFontSize(10).setFontWeight('bold')
+    .setHorizontalAlignment('left').setVerticalAlignment('middle');
+  ws.setRowHeight(3, 22);
+
+  // Single status column now — 7 columns total
+  var gHeaders = ['Status', 'Ingredient', 'Scaled Amount', 'For Meal(s)', 'Category', 'HEB Link', 'Notes'];
+  var gWidths  = [85,        210,           130,             200,           140,         100,         165];
+  for (var i = 0; i < gHeaders.length; i++) {
+    ws.getRange(4, i + 1)
+      .setValue(gHeaders[i])
+      .setBackground(C.GREEN_DARK).setFontColor(C.WHITE).setFontFamily('Arial').setFontSize(10).setFontWeight('bold')
+      .setHorizontalAlignment('center').setVerticalAlignment('middle').setWrap(true)
+      .setBorder(true, true, true, true, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+    ws.setColumnWidth(i + 1, gWidths[i]);
+  }
+  ws.setRowHeight(4, 28);
+
+  // 25 blank ingredient rows
+  for (var i = 0; i < 25; i++) {
+    var r  = i + 5;
+    var bg = (i % 2 === 0) ? C.WHITE : C.GRAY_LIGHT;
+    ws.getRange(r, 1, 1, 7).setBackground(bg).setFontFamily('Arial').setFontSize(9)
+      .setBorder(true, true, true, true, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+    ws.setRowHeight(r, 20);
+  }
+
+  addDropdown(ws, 'A5:A29', ['Need It', 'Have It', 'In Cart']);
+  applyStatusFormatting(ws, 5, 29);
+
+  ws.setRowHeight(30, 12);
+
+  // Standing list section
+  ws.getRange(31, 1, 1, 7).merge()
+    .setValue('STANDING GROCERY LIST  (your regular household items — edit freely)')
+    .setBackground(C.ORANGE).setFontColor(C.WHITE).setFontFamily('Arial').setFontSize(10).setFontWeight('bold')
+    .setHorizontalAlignment('left').setVerticalAlignment('middle');
+  ws.setRowHeight(31, 22);
+
+  for (var i = 0; i < gHeaders.length; i++) {
+    ws.getRange(32, i + 1)
+      .setValue(gHeaders[i])
+      .setBackground(C.ORANGE).setFontColor(C.WHITE).setFontFamily('Arial').setFontSize(10).setFontWeight('bold')
+      .setHorizontalAlignment('center').setVerticalAlignment('middle').setWrap(true)
+      .setBorder(true, true, true, true, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+  }
+  ws.setRowHeight(32, 28);
+
+  var standing = [
+    ['Milk (whole)',       '1 gallon',     'Dairy',     'milk'],
+    ['Eggs (large)',       '1 dozen',      'Dairy',     'large eggs'],
+    ['Butter (salted)',    '1 stick pack', 'Dairy',     'salted butter'],
+    ['Bread (sandwich)',   '1 loaf',       'Bakery',    'sandwich bread'],
+    ['Olive Oil',          '1 bottle',     'Pantry',    'olive oil'],
+    ['Rice (long grain)',  '2 lb bag',     'Dry Goods', 'long grain rice'],
+    ['Chicken Broth',      '32 oz carton', 'Pantry',    'chicken broth'],
+    ['Snack Bars',         '1 box',        'Snacks',    'snack bars'],
+    ['Paper Towels',       '1 pack',       'Household', 'paper towels'],
+    ['Dish Soap',          '1 bottle',     'Household', 'dish soap'],
+    ['Trash Bags',         '1 box',        'Household', 'trash bags'],
+    ['Laundry Detergent',  '1 bottle',     'Household', 'laundry detergent'],
+  ];
+
+  for (var i = 0; i < standing.length; i++) {
+    var r    = 33 + i;
+    var item = standing[i];
+    var bg   = (i % 2 === 0) ? C.ORANGE_LIGHT : C.WHITE;
+    var hebUrl = 'https://www.heb.com/search/?q=' + encodeURIComponent(item[3]);
+
+    ws.getRange(r, 1).setValue('Need It').setBackground(bg).setFontFamily('Arial').setFontSize(9).setHorizontalAlignment('center')
+      .setBorder(true, true, true, true, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+    ws.getRange(r, 2).setValue(item[0]).setBackground(bg).setFontFamily('Arial').setFontSize(9)
+      .setBorder(true, true, true, true, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+    ws.getRange(r, 3).setValue(item[1]).setBackground(bg).setFontFamily('Arial').setFontSize(9)
+      .setBorder(true, true, true, true, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+    ws.getRange(r, 4).setValue('—').setBackground(bg).setFontFamily('Arial').setFontSize(9).setHorizontalAlignment('center')
+      .setBorder(true, true, true, true, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+    ws.getRange(r, 5).setValue(item[2]).setBackground(bg).setFontFamily('Arial').setFontSize(9)
+      .setBorder(true, true, true, true, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+    ws.getRange(r, 6)
+      .setFormula('=HYPERLINK("' + hebUrl + '","HEB Link")')
+      .setBackground(bg).setFontColor(C.BLUE_LINK).setHorizontalAlignment('center')
+      .setBorder(true, true, true, true, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+    ws.getRange(r, 7).setValue('').setBackground(bg)
+      .setBorder(true, true, true, true, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+    ws.setRowHeight(r, 20);
+  }
+
+  var standEnd = 33 + standing.length - 1;
+  addDropdown(ws, 'A33:A' + (standEnd + 15), ['Need It', 'Have It', 'In Cart']);
+  applyStatusFormatting(ws, 33, standEnd + 15);
+}
+
+// ============================================================
+//  TAB 4: MEAL CATALOGUE
+// ============================================================
+function buildCatalogueTab(ss) {
+  var ws = ss.insertSheet(SN.CATALOGUE);
+  ws.setFrozenRows(3);
+  ws.setHiddenGridlines(true);
+
+  ws.getRange(1, 1, 1, 8).merge()
+    .setValue('MEAL CATALOGUE — Your Personal Recipe Library')
+    .setBackground(C.GREEN_DARK).setFontColor(C.WHITE).setFontFamily('Arial').setFontSize(16).setFontWeight('bold')
+    .setHorizontalAlignment('center').setVerticalAlignment('middle');
+  ws.setRowHeight(1, 40);
+
+  ws.getRange(2, 1, 1, 8).merge()
+    .setValue('Rate meals after cooking. Claude references this list to avoid repeating recent meals.')
+    .setBackground(C.GREEN_LIGHT).setFontColor(C.TEXT_MED).setFontFamily('Arial').setFontSize(10).setFontStyle('italic')
+    .setHorizontalAlignment('center').setVerticalAlignment('middle');
+  ws.setRowHeight(2, 22);
+
+  var headers = ['Meal Name', 'Cuisine', 'Cook Time', 'Last Made', 'Times Made', 'Rating (1-5)', 'Make Again?', 'Notes'];
+  var widths  = [220,         120,       90,          105,          95,            110,            130,            210];
+  for (var i = 0; i < headers.length; i++) {
+    ws.getRange(3, i + 1)
+      .setValue(headers[i])
+      .setBackground(C.GREEN_DARK).setFontColor(C.WHITE).setFontFamily('Arial').setFontSize(10).setFontWeight('bold')
+      .setHorizontalAlignment('center').setVerticalAlignment('middle').setWrap(true)
+      .setBorder(true, true, true, true, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+    ws.setColumnWidth(i + 1, widths[i]);
+  }
+  ws.setRowHeight(3, 28);
+
+  addDropdown(ws, 'G4:G100', ['Yes - Make Again!', 'Maybe', 'No']);
+
+  var seed = [
+    ['Sheet Pan Lemon Herb Chicken', 'American', '35 min', '', 0, '', '', ''],
+    ['Ground Beef Tacos',            'Tex-Mex',  '25 min', '', 0, '', '', ''],
+    ['Creamy Garlic Pasta',          'Italian',  '30 min', '', 0, '', '', ''],
+    ['Teriyaki Salmon and Rice',     'Asian',    '30 min', '', 0, '', '', ''],
+    ['Black Bean Chicken Bowls',     'Tex-Mex',  '30 min', '', 0, '', '', ''],
+    ['Sausage and Veggie Skillet',   'American', '25 min', '', 0, '', '', ''],
+    ['Honey Garlic Shrimp Stir Fry', 'Asian',    '25 min', '', 0, '', '', ''],
+  ];
+
+  for (var i = 0; i < seed.length; i++) {
+    var r  = i + 4;
+    var bg = (i % 2 === 0) ? C.WHITE : C.GRAY_LIGHT;
+    ws.getRange(r, 1, 1, 8).setValues([seed[i]])
+      .setBackground(bg).setFontFamily('Arial').setFontSize(10).setVerticalAlignment('middle')
+      .setBorder(true, true, true, true, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+    ws.getRange(r, 1).setFontWeight('bold').setFontColor(C.GREEN_DARK);
+    ws.setRowHeight(r, 22);
+  }
+}
+
+// ============================================================
+//  TAB 5: PANTRY AND STAPLES
+// ============================================================
+function buildPantryTab(ss) {
+  var ws = ss.insertSheet(SN.PANTRY);
+  ws.setFrozenRows(3);
+  ws.setHiddenGridlines(true);
+
+  ws.getRange(1, 1, 1, 5).merge()
+    .setValue('PANTRY AND STAPLES TRACKER')
+    .setBackground(C.GREEN_DARK).setFontColor(C.WHITE).setFontFamily('Arial').setFontSize(16).setFontWeight('bold')
+    .setHorizontalAlignment('center').setVerticalAlignment('middle');
+  ws.setRowHeight(1, 40);
+
+  ws.getRange(2, 1, 1, 5).merge()
+    .setValue('Mark items you always keep at home — Claude will skip adding these to your grocery list')
+    .setBackground(C.GREEN_LIGHT).setFontColor(C.TEXT_MED).setFontFamily('Arial').setFontSize(10).setFontStyle('italic')
+    .setHorizontalAlignment('center').setVerticalAlignment('middle');
+  ws.setRowHeight(2, 22);
+
+  var headers = ['Item', 'Category', 'On Hand?', 'Notes', 'HEB Link'];
+  var widths  = [210,    120,         120,         210,      120];
+  for (var i = 0; i < headers.length; i++) {
+    ws.getRange(3, i + 1)
+      .setValue(headers[i])
+      .setBackground(C.GREEN_DARK).setFontColor(C.WHITE).setFontFamily('Arial').setFontSize(10).setFontWeight('bold')
+      .setHorizontalAlignment('center').setVerticalAlignment('middle')
+      .setBorder(true, true, true, true, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+    ws.setColumnWidth(i + 1, widths[i]);
+  }
+  ws.setRowHeight(3, 28);
+
+  addDropdown(ws, 'C4:C100', ['Yes', 'No', 'Running Low']);
+
+  var items = [
+    ['Olive Oil',            'Oils',       'Yes', '',                'olive oil'],
+    ['Butter',               'Dairy',      'Yes', '',                'butter'],
+    ['Garlic',               'Produce',    'Yes', '',                'garlic'],
+    ['Yellow Onion',         'Produce',    'Yes', '',                'onion'],
+    ['Salt',                 'Spices',     'Yes', '',                ''],
+    ['Black Pepper',         'Spices',     'Yes', '',                ''],
+    ['Cumin',                'Spices',     'Yes', '',                'cumin'],
+    ['Paprika',              'Spices',     'Yes', '',                'paprika'],
+    ['Taco Seasoning',       'Spices',     'Yes', '',                'taco seasoning'],
+    ['Chili Powder',         'Spices',     'Yes', '',                'chili powder'],
+    ['Garlic Powder',        'Spices',     'Yes', '',                'garlic powder'],
+    ['Italian Seasoning',    'Spices',     'Yes', '',                'italian seasoning'],
+    ['Soy Sauce',            'Condiments', 'Yes', '',                'soy sauce'],
+    ['Honey',                'Condiments', 'Yes', '',                'honey'],
+    ['Hot Sauce',            'Condiments', 'Yes', '',                'hot sauce'],
+    ['Chicken Broth',        'Pantry',     'Yes', 'Keep 2 cartons',  'chicken broth'],
+    ['Canned Diced Tomatoes','Pantry',     'Yes', '',                'diced tomatoes'],
+    ['Canned Black Beans',   'Pantry',     'Yes', '',                'black beans'],
+    ['Rice (long grain)',    'Dry Goods',  'Yes', '',                'long grain rice'],
+    ['Pasta',                'Dry Goods',  'Yes', '',                'pasta'],
+    ['All-Purpose Flour',    'Baking',     'Yes', '',                'all purpose flour'],
+    ['Heavy Cream',          'Dairy',      'No',  'Buy as needed',   'heavy cream'],
+    ['Parmesan Cheese',      'Dairy',      'No',  '',                'parmesan cheese'],
+  ];
+
+  for (var i = 0; i < items.length; i++) {
+    var r    = i + 4;
+    var item = items[i];
+    var bg   = (i % 2 === 0) ? C.WHITE : C.GRAY_LIGHT;
+
+    ws.getRange(r, 1).setValue(item[0]).setBackground(bg).setFontFamily('Arial').setFontSize(10).setFontWeight('bold')
+      .setBorder(true, true, true, true, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+    ws.getRange(r, 2).setValue(item[1]).setBackground(bg).setFontFamily('Arial').setFontSize(10)
+      .setBorder(true, true, true, true, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+    ws.getRange(r, 4).setValue(item[3]).setBackground(bg).setFontFamily('Arial').setFontSize(10)
+      .setBorder(true, true, true, true, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+    ws.setRowHeight(r, 20);
+
+    var statusBg = (item[2] === 'Yes') ? C.GREEN_LIGHT : (item[2] === 'No') ? C.RED_LIGHT : C.YELLOW;
+    ws.getRange(r, 3).setValue(item[2]).setBackground(statusBg).setFontFamily('Arial').setFontSize(10)
+      .setHorizontalAlignment('center')
+      .setBorder(true, true, true, true, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+
+    if (item[4]) {
+      var hebUrl = 'https://www.heb.com/search/?q=' + encodeURIComponent(item[4]);
+      ws.getRange(r, 5)
+        .setFormula('=HYPERLINK("' + hebUrl + '","HEB Link")')
+        .setBackground(bg).setFontColor(C.BLUE_LINK).setHorizontalAlignment('center')
+        .setBorder(true, true, true, true, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+    } else {
+      ws.getRange(r, 5).setValue('').setBackground(bg)
+        .setBorder(true, true, true, true, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+    }
+  }
+}
+
+// ============================================================
+//  GENERATE MEALS
+// ============================================================
+function generateMeals() {
+  var ss     = SpreadsheetApp.getActiveSpreadsheet();
+  var ui     = SpreadsheetApp.getUi();
+  var apiKey = PropertiesService.getScriptProperties().getProperty('ANTHROPIC_API_KEY');
+
+  if (!apiKey) {
+    ui.alert('Missing API Key',
+      'Add your Anthropic API key:\nExtensions > Apps Script > Project Settings > Script Properties\n\nProperty: ANTHROPIC_API_KEY\nValue: your key from console.anthropic.com',
+      ui.ButtonSet.OK);
+    return;
+  }
+
+  var confirm = ui.alert('Generate New Meals',
+    'This replaces the 7 current meal suggestions.\n\nSave any rated meals to Catalogue first!\n\nContinue?',
+    ui.ButtonSet.YES_NO);
+  if (confirm !== ui.Button.YES) return;
+
+  ss.toast('Asking Claude for meal ideas... about 15 seconds', 'Generating', 20);
+
+  var result = callClaude(buildPrompt(getCatalogueMealNames(), getPantryItems()), apiKey);
+
+  if (!result.success) {
+    ui.alert('Claude API Error', result.error, ui.ButtonSet.OK);
+    return;
+  }
+
+  var meals = parseJSON(result.content);
+  if (!meals) {
+    ui.alert('Parse Error', 'Could not parse Claude response. Check Execution Logs.', ui.ButtonSet.OK);
+    Logger.log('Raw: ' + result.content);
+    return;
+  }
+
+  writeMeals(ss, meals);
+  writeRecipes(ss, meals);
+  refreshGroceryList();
+
+  ss.toast('Done! 7 new meals generated. Select your favorites.', 'Meals Ready', 5);
+}
+
+// ── PROMPT — healthier, more varied ──────────────────────────
+function buildPrompt(catalogueMeals, pantryItems) {
+  var recent = catalogueMeals.slice(0, 30).join(', ') || 'None yet';
+  var pantry = pantryItems.join(', ')                 || 'Standard pantry staples';
+
+  return 'You are a family meal planning assistant focused on healthy, flavorful weeknight dinners.\n\n' +
+
+    'REQUIREMENTS:\n' +
+    '- Family of 2 adults (base serving size = 2)\n' +
+    '- Easy to cook — max 30-45 minutes total, minimal prep\n' +
+    '- Healthy skew: lean proteins, vegetables, whole grains, minimal heavy cream or deep frying\n' +
+    '- Only ingredients available at HEB grocery stores in Texas — no specialty stores\n' +
+    '- Max 8-10 ingredients per meal (not counting pantry staples)\n' +
+    '- Generate exactly 7 meals with good variety across these cuisine types:\n' +
+    '    Tex-Mex, Asian (any), Mediterranean or Middle Eastern, American, Italian or European,\n' +
+    '    Latin American, and one wildcard (any cuisine not already covered)\n\n' +
+
+    'HEALTHY COOKING METHODS TO FAVOR:\n' +
+    '- Sheet pan roasting, stovetop saute, stir fry, grilling, broiling\n' +
+    '- Lean proteins: chicken breast or thighs, fish, shrimp, lean ground turkey or beef, legumes\n' +
+    '- Load up on vegetables — at least 2 per meal\n' +
+    '- Use whole grains where natural: brown rice, quinoa, whole wheat tortillas, farro\n\n' +
+
+    'PANTRY ITEMS ALREADY ON HAND (exclude from ingredient list):\n' + pantry + '\n\n' +
+    'RECENT MEALS TO AVOID REPEATING:\n' + recent + '\n\n' +
+
+    'INGREDIENT FORMAT: Store quantities as base amounts for 2 adults.\n' +
+    'Use decimal multipliers so they can scale: "0.5 lb", "1 tbsp", "2 cups" etc.\n' +
+    'Avoid fractional text like "half a" — use numbers only: "0.5 lb" not "half a pound".\n\n' +
+
+    'Return ONLY valid JSON — no markdown, no explanation:\n' +
+    '{\n' +
+    '  "meals": [\n' +
+    '    {\n' +
+    '      "number": 1,\n' +
+    '      "name": "Meal Name",\n' +
+    '      "cuisine": "Cuisine Type",\n' +
+    '      "cookTime": "XX min",\n' +
+    '      "ingredients": [\n' +
+    '        {"item": "ingredient name", "qty": 0.5, "unit": "lb", "category": "Produce|Meat and Seafood|Dairy|Dry Goods|Pantry|Spices|Condiments|Frozen"}\n' +
+    '      ],\n' +
+    '      "instructions": "1. Step one\\n2. Step two\\n3. Step three\\n4. Step four\\n5. Step five",\n' +
+    '      "cookTip": "One helpful tip",\n' +
+    '      "hebSearch": "2-3 word HEB search term for main protein or ingredient"\n' +
+    '    }\n' +
+    '  ]\n' +
+    '}';
+}
+
+// ── CLAUDE API ────────────────────────────────────────────────
+function callClaude(prompt, apiKey) {
+  var options = {
+    method: 'post',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01'
+    },
+    payload: JSON.stringify({
+      model: CLAUDE_MODEL,
+      max_tokens: 4096,
+      messages: [{ role: 'user', content: prompt }]
+    }),
+    muteHttpExceptions: true
+  };
+  try {
+    var res  = UrlFetchApp.fetch('https://api.anthropic.com/v1/messages', options);
+    var code = res.getResponseCode();
+    var body = JSON.parse(res.getContentText());
+    if (code !== 200) return { success: false, error: 'HTTP ' + code + ': ' + (body.error ? body.error.message : 'Unknown') };
+    return { success: true, content: body.content[0].text };
+  } catch(e) {
+    return { success: false, error: e.toString() };
+  }
+}
+
+function parseJSON(content) {
+  try {
+    var clean = content.replace(/```json/g, '').replace(/```/g, '').trim();
+    return JSON.parse(clean).meals || null;
+  } catch(e) {
+    Logger.log('Parse error: ' + e + '\n' + content);
+    return null;
+  }
+}
+
+function writeMeals(ss, meals) {
+  var ws = ss.getSheetByName(SN.MEALS);
+  for (var i = 0; i < meals.length; i++) {
+    var r = i + 4;
+    var m = meals[i];
+    ws.getRange(r, COL.NUM).setValue(m.number);
+    ws.getRange(r, COL.NAME).setValue(m.name);
+    ws.getRange(r, COL.CUISINE).setValue(m.cuisine);
+    ws.getRange(r, COL.COOK_TIME).setValue(m.cookTime);
+    // Adults and Leftover Nights keep their current values — don't overwrite
+    // Total Servings formula is already there — no change needed
+    ws.getRange(r, COL.SELECT).setValue('No');
+    ws.getRange(r, COL.LAST_MADE).setValue('');
+    ws.getRange(r, COL.RATING).setValue('');
+  }
+}
+
+function writeRecipes(ss, meals) {
+  var ws = ss.getSheetByName(SN.RECIPES);
+  ws.getRange(4, 1, 10, 6).clearContent();
+
+  for (var i = 0; i < meals.length; i++) {
+    var r   = i + 4;
+    var m   = meals[i];
+    var bg  = (i % 2 === 0) ? C.WHITE : C.GRAY_LIGHT;
+
+    // Store ingredients as JSON string so refreshGroceryList can parse qty + unit
+    var ingredDisplay = '';
+    for (var j = 0; j < m.ingredients.length; j++) {
+      var ing = m.ingredients[j];
+      ingredDisplay += '- ' + ing.qty + ' ' + ing.unit + '  ' + ing.item + '\n';
+    }
+    ingredDisplay = ingredDisplay.trim();
+
+    ws.getRange(r, 1, 1, 5).setValues([[m.number, m.name, ingredDisplay, m.instructions, m.cookTip || '']])
+      .setBackground(bg).setFontFamily('Arial').setFontSize(9)
+      .setVerticalAlignment('top').setWrap(true)
+      .setBorder(true, true, true, true, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+    ws.getRange(r, 2).setFontWeight('bold').setFontColor(C.GREEN_DARK).setFontSize(10);
+
+    var hebUrl = 'https://www.heb.com/search/?q=' + encodeURIComponent(m.hebSearch || m.name);
+    ws.getRange(r, 6)
+      .setFormula('=HYPERLINK("' + hebUrl + '","Search HEB")')
+      .setBackground(bg).setFontColor(C.BLUE_LINK)
+      .setHorizontalAlignment('center').setVerticalAlignment('top')
+      .setBorder(true, true, true, true, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+    ws.setRowHeight(r, 130);
+  }
+}
+
+// ============================================================
+//  REFRESH GROCERY LIST — scales quantities by Adults + Leftover Nights
+// ============================================================
+function refreshGroceryList() {
+  var ss        = SpreadsheetApp.getActiveSpreadsheet();
+  var mealsWs   = ss.getSheetByName(SN.MEALS);
+  var recipesWs = ss.getSheetByName(SN.RECIPES);
+  var groceryWs = ss.getSheetByName(SN.GROCERY);
+
+  // Get selected meals with their Adults + Leftover Night multipliers
+  // Columns: NUM(1) NAME(2) CUISINE(3) COOKTIME(4) ADULTS(5) LEFTOVER(6) SERVINGS(7) SELECT(8)
+  var mealData = mealsWs.getRange(4, 1, 7, 8).getValues();
+  var selected = [];
+  for (var i = 0; i < mealData.length; i++) {
+    if (String(mealData[i][7]) === 'Yes') {
+      var adults   = Number(mealData[i][4]) || 2;
+      var leftover = Number(mealData[i][5]) || 1;
+      var multiplier = adults * (1 + leftover) / 2; // divide by 2 because base qty is for 2 adults
+      selected.push({ name: String(mealData[i][1]), multiplier: multiplier });
+    }
+  }
+
+  if (selected.length === 0) {
+    ss.toast('No meals selected. Mark Yes on meals first.', 'Nothing Selected', 4);
+    return;
+  }
+
+  var pantryItems = getPantryItems();
+  var recipeData  = recipesWs.getRange(4, 1, 10, 5).getValues();
+  var seen        = {};
+  var ingredients = [];
+
+  for (var i = 0; i < recipeData.length; i++) {
+    var mealName = String(recipeData[i][1]);
+    var selMatch = null;
+    for (var s = 0; s < selected.length; s++) {
+      if (selected[s].name === mealName) { selMatch = selected[s]; break; }
+    }
+    if (!selMatch) continue;
+
+    var lines = String(recipeData[i][2]).split('\n');
+    for (var j = 0; j < lines.length; j++) {
+      var clean = lines[j].replace(/^[-]\s*/, '').trim();
+      if (!clean) continue;
+
+      // Format stored by writeRecipes: "qty unit  item name"
+      var parts    = clean.split(/\s{2,}/);
+      var qtyUnit  = parts.length > 1 ? parts[0].trim() : '';
+      var itemName = parts.length > 1 ? parts.slice(1).join(' ').trim() : clean;
+
+      // Parse numeric qty for scaling
+      var qtyMatch = qtyUnit.match(/^(\d+\.?\d*)\s*(.*)$/);
+      var baseQty  = qtyMatch ? parseFloat(qtyMatch[1]) : null;
+      var unit     = qtyMatch ? qtyMatch[2].trim() : qtyUnit;
+
+      var scaledQtyStr;
+      if (baseQty !== null) {
+        var scaled = baseQty * selMatch.multiplier;
+        // Round to 1 decimal, trim trailing zero
+        scaled = Math.round(scaled * 10) / 10;
+        scaledQtyStr = (scaled % 1 === 0 ? scaled.toFixed(0) : scaled.toFixed(1)) + (unit ? ' ' + unit : '');
+      } else {
+        scaledQtyStr = qtyUnit; // non-numeric qty like "to taste" — keep as-is
+      }
+
+      var key = itemName.toLowerCase().split(/\s+/).slice(0, 3).join(' ');
+
+      var inPantry = false;
+      for (var p = 0; p < pantryItems.length; p++) {
+        if (itemName.toLowerCase().indexOf(pantryItems[p].toLowerCase().split(' ')[0]) >= 0) {
+          inPantry = true; break;
+        }
+      }
+
+      if (seen[key]) {
+        for (var k = 0; k < ingredients.length; k++) {
+          if (ingredients[k].key === key) {
+            // Merge: add quantities if same unit, otherwise just append meal name
+            if (ingredients[k].unit === unit && baseQty !== null) {
+              ingredients[k].baseQty += baseQty;
+              var newScaled = Math.round(ingredients[k].baseQty * selMatch.multiplier * 10) / 10;
+              ingredients[k].scaledQtyStr = (newScaled % 1 === 0 ? newScaled.toFixed(0) : newScaled.toFixed(1)) + (unit ? ' ' + unit : '');
+            }
+            if (ingredients[k].forMeals.indexOf(mealName) < 0) {
+              ingredients[k].forMeals += '\n' + mealName;
+            }
+            break;
+          }
+        }
+      } else {
+        seen[key] = true;
+        ingredients.push({
+          key:          key,
+          item:         itemName,
+          baseQty:      baseQty,
+          unit:         unit,
+          scaledQtyStr: scaledQtyStr,
+          forMeals:     mealName,
+          inPantry:     inPantry,
+          category:     guessCategory(itemName)
+        });
+      }
+    }
+  }
+
+  ingredients.sort(function(a, b) {
+    if (a.category < b.category) return -1;
+    if (a.category > b.category) return 1;
+    return a.item.localeCompare(b.item);
+  });
+
+  // Clear existing meal rows
+  groceryWs.getRange(5, 1, 25, 7).clearContent().setBackground(C.WHITE).setFontColor('#222222');
+
+  var limit = Math.min(ingredients.length, 25);
+  for (var i = 0; i < limit; i++) {
+    var r      = i + 5;
+    var ing    = ingredients[i];
+    var bg     = (i % 2 === 0) ? C.WHITE : C.GRAY_LIGHT;
+    var status = ing.inPantry ? 'Have It' : 'Need It';
+    var hebUrl = 'https://www.heb.com/search/?q=' + encodeURIComponent(ing.item.split(' ').slice(0, 3).join(' '));
+
+    groceryWs.getRange(r, 1).setValue(status).setBackground(bg).setFontFamily('Arial').setFontSize(9).setHorizontalAlignment('center')
+      .setBorder(true, true, true, true, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+    groceryWs.getRange(r, 2).setValue(ing.item).setBackground(bg).setFontFamily('Arial').setFontSize(9)
+      .setBorder(true, true, true, true, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+    groceryWs.getRange(r, 3).setValue(ing.scaledQtyStr).setBackground(bg).setFontFamily('Arial').setFontSize(9)
+      .setBorder(true, true, true, true, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+    groceryWs.getRange(r, 4).setValue(ing.forMeals).setBackground(bg).setFontFamily('Arial').setFontSize(9).setWrap(true)
+      .setBorder(true, true, true, true, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+    groceryWs.getRange(r, 5).setValue(ing.category).setBackground(bg).setFontFamily('Arial').setFontSize(9)
+      .setBorder(true, true, true, true, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+    groceryWs.getRange(r, 6)
+      .setFormula('=HYPERLINK("' + hebUrl + '","HEB Link")')
+      .setBackground(bg).setFontColor(C.BLUE_LINK).setHorizontalAlignment('center')
+      .setBorder(true, true, true, true, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+    groceryWs.getRange(r, 7).setValue('').setBackground(bg)
+      .setBorder(true, true, true, true, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+    groceryWs.setRowHeight(r, 20);
+  }
+
+  ss.toast('Grocery list updated: ' + ingredients.length + ' ingredients scaled for ' + selected.length + ' meals.', 'Done', 4);
+}
+
+// ============================================================
+//  SAVE RATED MEALS TO CATALOGUE
+//  Also stamps Last Made date on the Weekly Meals tab
+// ============================================================
+function saveRatedMealsToCatalogue() {
+  var ss      = SpreadsheetApp.getActiveSpreadsheet();
+  var mealsWs = ss.getSheetByName(SN.MEALS);
+  var catWs   = ss.getSheetByName(SN.CATALOGUE);
+  var ui      = SpreadsheetApp.getUi();
+  var today   = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'MM/dd/yyyy');
+  var saved   = 0;
+  var updated = 0;
+
+  var mealRows     = mealsWs.getRange(4, 1, 7, 10).getValues();
+  var catLastRow   = catWs.getLastRow();
+  var existingData = catLastRow >= 4 ? catWs.getRange(4, 1, catLastRow - 3, 1).getValues() : [];
+  var existingNames = [];
+  for (var i = 0; i < existingData.length; i++) {
+    existingNames.push(String(existingData[i][0]).toLowerCase());
+  }
+
+  for (var i = 0; i < mealRows.length; i++) {
+    var row    = mealRows[i];
+    var name   = String(row[COL.NAME - 1]);
+    var rating = row[COL.RATING - 1];
+    if (!name || !rating) continue;
+
+    // Auto-stamp Last Made on Weekly Meals tab
+    mealsWs.getRange(i + 4, COL.LAST_MADE).setValue(today);
+
+    var nameLower = name.toLowerCase();
+    var idx = existingNames.indexOf(nameLower);
+
+    if (idx >= 0) {
+      var catRow    = idx + 4;
+      var timesMade = Number(catWs.getRange(catRow, 5).getValue()) || 0;
+      catWs.getRange(catRow, 4).setValue(today);
+      catWs.getRange(catRow, 5).setValue(timesMade + 1);
+      catWs.getRange(catRow, 6).setValue(rating);
+      catWs.getRange(catRow, 7).setValue(ratingLabel(rating));
+      updated++;
+    } else {
+      var newRow = catWs.getLastRow() + 1;
+      var bg     = (newRow % 2 === 0) ? C.WHITE : C.GRAY_LIGHT;
+      catWs.getRange(newRow, 1, 1, 8).setValues([[
+        name, String(row[COL.CUISINE - 1]), String(row[COL.COOK_TIME - 1]), today, 1, rating, ratingLabel(rating), ''
+      ]]).setBackground(bg).setFontFamily('Arial').setFontSize(10)
+        .setBorder(true, true, true, true, true, true, '#CCCCCC', SpreadsheetApp.BorderStyle.SOLID);
+      catWs.getRange(newRow, 1).setFontWeight('bold').setFontColor(C.GREEN_DARK);
+      existingNames.push(nameLower);
+      saved++;
+    }
+  }
+
+  ui.alert('Catalogue Updated',
+    saved + ' new meal(s) added to Catalogue.\n' + updated + ' existing meal(s) updated.\n\nLast Made dates have been stamped on the Weekly Meals tab.',
+    ui.ButtonSet.OK);
+}
+
+function ratingLabel(r) {
+  var n = Number(r);
+  return n >= 4 ? 'Yes - Make Again!' : n >= 3 ? 'Maybe' : 'No';
+}
+
+function openHEBCartInfo() {
+  SpreadsheetApp.getUi().alert(
+    'HEB Cart Automation — Phase 2',
+    'Phase 2 will use Playwright to automatically add all grocery items to your HEB cart.\n\nFor now use the HEB links in the Grocery List tab to search items manually.\n\nPhase 2 setup guide will be provided when you are ready.',
+    SpreadsheetApp.getUi().ButtonSet.OK
+  );
+}
+
+// ============================================================
+//  HELPERS
+// ============================================================
+function addDropdown(ws, rangeA1, options) {
+  var rule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(options, true)
+    .setAllowInvalid(false)
+    .build();
+  ws.getRange(rangeA1).setDataValidation(rule);
+}
+
+// Three-state conditional formatting:
+// "Have It"  → gray out (you own it, skip)
+// "In Cart"  → green tint (you've added it)
+// "Need It"  → default (white/stripe)
+function applyStatusFormatting(ws, startRow, endRow) {
+  var rules = ws.getConditionalFormatRules();
+  for (var r = startRow; r <= endRow; r++) {
+    var rowRange = ws.getRange(r, 1, 1, 7);
+
+    var haveIt = SpreadsheetApp.newConditionalFormatRule()
+      .whenFormulaSatisfied('=$A' + r + '="Have It"')
+      .setBackground('#DADADA').setFontColor('#888888')
+      .setRanges([rowRange]).build();
+
+    var inCart = SpreadsheetApp.newConditionalFormatRule()
+      .whenFormulaSatisfied('=$A' + r + '="In Cart"')
+      .setBackground('#E8F5E9').setFontColor('#2E7D32')
+      .setRanges([rowRange]).build();
+
+    rules.push(haveIt);
+    rules.push(inCart);
+  }
+  ws.setConditionalFormatRules(rules);
+}
+
+function getCatalogueMealNames() {
+  var ws   = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SN.CATALOGUE);
+  var last = ws.getLastRow();
+  if (last < 4) return [];
+  var data  = ws.getRange(4, 1, last - 3, 1).getValues();
+  var names = [];
+  for (var i = 0; i < data.length; i++) {
+    if (data[i][0]) names.push(String(data[i][0]));
+  }
+  return names;
+}
+
+function getPantryItems() {
+  var ws   = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SN.PANTRY);
+  var last = ws.getLastRow();
+  if (last < 4) return [];
+  var data  = ws.getRange(4, 1, last - 3, 3).getValues();
+  var items = [];
+  for (var i = 0; i < data.length; i++) {
+    if (String(data[i][2]) === 'Yes') items.push(String(data[i][0]));
+  }
+  return items;
+}
+
+function guessCategory(item) {
+  var s = item.toLowerCase();
+  if (/chicken|beef|pork|shrimp|salmon|tuna|cod|tilapia|sausage|turkey|steak|lamb|ground/.test(s)) return 'Meat and Seafood';
+  if (/milk|cheese|cream|butter|yogurt|egg|feta|mozzarella/.test(s)) return 'Dairy';
+  if (/onion|garlic|lemon|lime|broccoli|pepper|tomato|lettuce|avocado|cilantro|potato|zucchini|spinach|kale|carrot|celery|corn|mushroom|asparagus|green bean|cucumber/.test(s)) return 'Produce';
+  if (/rice|pasta|bread|tortilla|flour|oat|noodle|panko|quinoa|farro|couscous|pita/.test(s)) return 'Dry Goods';
+  if (/oil|vinegar|soy sauce|hot sauce|honey|mustard|ketchup|mayo|salsa|teriyaki|tahini|sriracha|fish sauce/.test(s)) return 'Condiments';
+  if (/salt|pepper|cumin|paprika|oregano|thyme|rosemary|seasoning|spice|chili powder|turmeric|curry|coriander|cardamom/.test(s)) return 'Spices';
+  if (/broth|stock|bean|tomato sauce|coconut milk|canned|lentil/.test(s)) return 'Pantry and Canned';
+  if (/frozen/.test(s)) return 'Frozen';
+  return 'Other';
+}
